@@ -1,0 +1,1308 @@
+---
+# DO NOT knit with runtime: shiny. This renders a static, self‑contained flexdashboard.
+title: "Integrated Regression and Classification Modeling for Operational Insight and Process Optimization in Chicago from 2014 to 2024"
+author: "Team: Louie Finder, Liam O'Donnell, Mason Colt "
+date: "Fall 2025"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+    self_contained: true
+    theme: cosmo
+    code_folding: none
+    source_code: FALSE
+---
+
+```{r setup, include=FALSE}
+# Knit/display options
+knitr::opts_chunk$set(
+  echo = FALSE, message = FALSE, warning = FALSE,
+  fig.width = 8, fig.height = 4.5
+)
+set.seed(100)
+
+# Core data wrangling & plotting
+library(tidyverse)
+library(janitor)
+library(kableExtra)
+
+# Modeling utilities
+library(caret)
+library(e1071)
+library(class)
+library(FNN)
+library(gmodels)
+library(broom)
+library(car)      
+library(MASS)   
+library(glmnet)
+library(pROC)   
+library(lmtest)
+library(sandwich)
+library(splines)
+
+# Geo & dashboard
+library(sf)
+library(flexdashboard)
+```
+
+```{r data_raw, include=FALSE}
+
+base <- "https://data.cityofchicago.org/resource/building-permits.csv"
+
+cols <- c(
+  "id","permit_","permit_status","permit_milestone","permit_type","review_type",
+  "application_start_date","issue_date","processing_time",
+  "street_number","street_direction","street_name",
+  "work_type","work_description","permit_condition",
+  "building_fee_paid","zoning_fee_paid","other_fee_paid","subtotal_paid",
+  "building_fee_unpaid","zoning_fee_unpaid","other_fee_unpaid","subtotal_unpaid",
+  "building_fee_waived","zoning_fee_waived","other_fee_waived","subtotal_waived",
+  "building_fee_subtotal","zoning_fee_subtotal","other_fee_subtotal","total_fee",
+  "reported_cost","pin_list",
+  "community_area","census_tract","ward",
+  "xcoordinate","ycoordinate","latitude","longitude","location"
+)
+
+soql <- sprintf(
+  "SELECT %s WHERE application_start_date BETWEEN '2014-01-01T00:00:00' AND '2024-12-31T23:59:59' LIMIT 200000",
+  paste(cols, collapse = ", ")
+)
+
+url <- paste0(base, "?$query=", utils::URLencode(soql, reserved = TRUE))
+
+permits_raw <- read.csv(url, stringsAsFactors = FALSE, check.names = FALSE)
+
+names(permits_raw) <- gsub("\\.+", "_",
+                        tolower(make.names(names(permits_raw), unique = TRUE)))
+```
+
+```{r cleaning, include=FALSE}
+permits_raw <- na.omit(permits_raw)
+
+wt   <- trimws(gsub("\u00A0", " ", as.character(permits_raw$work_type)))
+keep <- !is.na(wt) & nzchar(wt)
+
+permits_raw <- permits_raw[keep, , drop = FALSE]
+permits_raw$work_type <- wt[keep]
+
+permits_raw$pin_list <- NULL
+permits_raw$permit_condition <- NULL
+permits_raw$work_description <- NULL
+permits_raw$street_number <- NULL
+permits_raw$street_direction <- NULL
+permits_raw$street_name <- NULL
+```
+
+```{r feature_engineering, include=FALSE}
+# Dates & calendar labels
+permits_raw <- permits_raw |>
+  mutate(
+    application_start_date = as.Date(application_start_date),
+    issue_date             = as.Date(issue_date),
+    app_date               = application_start_date,
+    month = factor(format(application_start_date, "%b"),
+                   levels = month.abb, ordered = TRUE),
+    dow   = factor(weekdays(application_start_date),
+                   levels = c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"),
+                   ordered = TRUE),
+    season = factor(case_when(
+      month %in% c("Dec","Jan","Feb") ~ "Winter",
+      month %in% c("Mar","Apr","May") ~ "Spring",
+      month %in% c("Jun","Jul","Aug") ~ "Summer",
+      TRUE                            ~ "Fall"
+    ), levels = c("Winter","Spring","Summer","Fall"))
+  )
+
+# Geography & area labels
+permits_raw <- permits_raw |>
+  mutate(
+    latitude  = suppressWarnings(as.numeric(latitude)),
+    longitude = suppressWarnings(as.numeric(longitude)),
+    area_ncs  = {
+      ok   <- !is.na(latitude)
+      cuts <- quantile(latitude[ok], probs = c(1/3, 2/3), na.rm = TRUE)
+      cut(latitude, breaks = c(-Inf, cuts[1], cuts[2], Inf),
+          labels = c("SOUTHSIDE","CENTRAL","NORTHSIDE"), include.lowest = TRUE)
+    },
+    community_area = suppressWarnings(as.integer(community_area)),
+    # Central = Loop(32), Near North(8), Near South(33), Near West(28)
+    is_central = factor(if_else(!is.na(community_area) & community_area %in% c(32, 8, 33, 28),
+                                "Central","Other"),
+                        levels = c("Central","Other"))
+  )
+
+# Fees: intensity
+permits_raw <- permits_raw |>
+  mutate(
+    across(c(total_fee, building_fee_subtotal, zoning_fee_subtotal, other_fee_subtotal,
+             subtotal_paid, subtotal_unpaid, subtotal_waived, reported_cost),
+           ~ suppressWarnings(as.numeric(.x))),
+    mix_building = if_else(total_fee > 0, building_fee_subtotal/total_fee, NA_real_),
+    mix_zoning   = if_else(total_fee > 0, zoning_fee_subtotal/total_fee,   NA_real_),
+    mix_other    = if_else(total_fee > 0, other_fee_subtotal/total_fee,    NA_real_),
+    fee_intensity_total  = if_else(reported_cost > 0, total_fee       / reported_cost, NA_real_),
+    fee_intensity_paid   = if_else(reported_cost > 0, subtotal_paid   / reported_cost, NA_real_),
+    fee_intensity_unpaid = if_else(reported_cost > 0, subtotal_unpaid / reported_cost, NA_real_),
+    fee_intensity_waived = if_else(reported_cost > 0, subtotal_waived / reported_cost, NA_real_),
+    cost_num = reported_cost
+  )
+
+permits_raw <- permits_raw |>
+  mutate(
+    processing_time = suppressWarnings(as.numeric(processing_time)),
+    processing_time = if_else(!is.na(processing_time) & processing_time < 0, NA_real_, processing_time),
+    fast_issue     = factor(if_else(!is.na(processing_time) & processing_time <= 7, "Yes","No"),
+                            levels = c("Yes","No")),
+    same_day_issue = factor(if_else(!is.na(processing_time) & processing_time == 0, "Yes","No"),
+                            levels = c("Yes","No"))
+  )
+
+#  Targets: Trade & Construction 
+permits_raw <- permits_raw |>
+  mutate(
+    work_type = as.character(work_type),
+    work2 = case_when(
+      is.na(work_type) ~ NA_character_,
+      work_type %in% c("Electrical Work","Mechanical Work","Plumbing Work",
+                       "Fire Alarm System","Small-Scale Solar PV System","Communication Equipment") ~ "Trade",
+      work_type %in% c("Detached Frame Garage","Exterior Windows/Doors Replacement","Fence or Trash Enclosure",
+                       "Masonry Work","Reroofing","Porch,Deck,Balcony,or Fire Escape",
+                       "Nonstructural Interior Work","Monthly Maintenance Permit","Other Work") ~ "Construction",
+      TRUE ~ "Construction"
+    ),
+    work2 = factor(work2, levels = c("Trade","Construction"))
+  )
+
+
+permits_raw <- permits_raw |>
+  mutate(
+    permit_type    = forcats::fct_explicit_na(as.factor(permit_type), "Unknown"),
+    area_ncs       = forcats::fct_explicit_na(
+                       factor(area_ncs, levels = c("SOUTHSIDE","CENTRAL","NORTHSIDE")),
+                       "Unknown"
+                     ),
+    ward           = forcats::fct_explicit_na(as.factor(ward), "Unknown"),
+    community_area = forcats::fct_explicit_na(as.factor(community_area), "Unknown")
+  )
+
+
+
+cut_date <- as.Date(
+  stats::quantile(as.numeric(permits_raw$app_date), 0.80, na.rm = TRUE, type = 1),
+  origin = "1970-01-01"
+)
+permits_raw <- permits_raw %>%
+  mutate(split_nb = if_else(app_date <= cut_date, "train", "test"))
+
+make_breaks <- function(x){
+  lx <- log1p(x[!is.na(x)])
+  if (length(lx) == 0) return(NULL)
+  qs <- unique(as.numeric(stats::quantile(lx, probs = c(0.20,0.40,0.60,0.80), na.rm = TRUE)))
+  qs <- sort(qs[is.finite(qs)])
+  if (length(qs)) c(-Inf, qs, Inf) else c(-Inf, Inf)
+}
+bin_cost <- function(x, brks){
+  if (is.null(brks)) return(factor(rep("Unknown", length(x))))
+  b <- cut(log1p(x), breaks = brks, include.lowest = TRUE, ordered_result = TRUE)
+  out <- as.character(b); out[is.na(out)] <- "Unknown"; factor(out)
+}
+
+brks_nb <- make_breaks(permits_raw$cost_num[permits_raw$split_nb == "train"])
+permits_raw <- permits_raw %>%
+  mutate(nb_cost_bin = bin_cost(cost_num, brks_nb))
+```
+
+# Abstract {data-icon="fa-clipboard-list"}
+
+## Column {data-width="650"}
+
+### Data and Source
+
+**Data and Source:** Comprehensive Analysis of the Chicago Permit Dataset (2014–2024).\
+Access the dataset [here](https://data.cityofchicago.org/resource/building-permits.csv).
+
+**Title:** Integrated Regression and Classification Modeling for Operational Insight and Process Optimization
+
+The Chicago Building Permit Dataset (2014–2024) provides a rich, multi-dimensional view of municipal planning and construction activity. It contains over a million records detailing transactional elements (cost, fees, dates) and geographic information (ward, neighborhood). This comprehensive feature set enables sophisticated statistical inquiry into factors that drive construction activity and administrative efficiency.
+
+## Column {data-width="350"}
+
+### Methodological Approach
+
+To address diverse goals of prediction, estimation, and classification related to permit processing, we deployed six distinct statistical and machine learning models:
+
+**A. Regression**
+
+These models estimate continuous outcomes, such as the number of days required for processing or the average reported cost of a project.
+
+-   **Multiple Linear Regression:** Baseline estimation and feature selection.
+-   **Ridge Regression (via glmnet):** Regularized estimation to handle highly correlated predictors and stabilize coefficients.
+-   **Natural Cubic Spline or LOESS Fit:** Captures non-linear trends in processing time or geographic patterns.
+
+**B. Classification**
+
+These models focus on the binary outcome of *Slow* vs. *Rapid* processing time to identify operational delays.
+
+-   **Logistic Regression:** Primary baseline classifier, interpretable and focused on feature importance.
+-   **k-Nearest Neighbors (kNN) Classification:** Non-parametric, distance-based classifier to test local predictability.
+-   **Naive Bayes Classification:** Evaluates performance under the assumption of feature independence.
+
+### Page Authors
+
+**Model Contributors**
+
+-   **Multiple Linear Regression:** Liam O'Donnell, Louis Finder
+
+-   **Ridge Regression:** Liam O'Donnell, Louis Finder
+
+-   **Natural Cubic Spline:** Mason Colt
+
+-   **Logistic Regression:** Mason Colt
+
+-   **k-Nearest Neighbors Classification:** Louis Finder
+
+-   **Naive Bayes Classification:** Louis Finder
+
+**Other Contributors**
+
+-   **Abstract:** Mason Colt
+
+-   **Data Introduction:** Mason Colt, Louis Finder
+
+# Data Introduction {data-icon="fa-database"}
+
+## Data Overview and Context
+
+<!-- This column acts as the container for the sequential text and tables below -->
+
+### About the Data
+
+This analysis is built upon a comprehensive collection of 64,863 construction permit records issued by the City of Chicago, spanning the years 2014 through 2024. The dataset provides granular, property-level detail covering all phases of the permitting life cycle. Key features include applicant-reported variables such as estimated project cost, the specific work type requested, and precise geographic coordinates. Additionally, administrative details, including a full breakdown of all associated fees (paid, unpaid, and waived) and the final, objective processing time, are captured for every record. This richness of detail allows for a deep examination of the administrative, financial, and spatial factors underlying the city's development activity.
+
+### Limitations of the Data
+
+The dataset provides rich transactional details, but its analytical utility is constrained by several common limitations inherent in publicly sourced administrative records.
+
+1.  **Data Quality and Variable Accuracy**
+
+    -   **Reliance on Estimated Cost:** The **`reported_cost`** is the applicant's initial estimate of project value, not the final, audited construction cost. This figure may be systematically biased (under- or overstated) by applicants during the submission process, which affects the fidelity of any cost-based financial or spatial metrics derived from it.
+
+    -   **Missing Payment Rationale:** While the dataset provides monetary amounts for fees that were **`paid`**, **`unpaid`**, and **`waived`**, it lacks the necessary qualitative detail. We cannot determine *why* a fee was waived (e.g., policy decision vs. error) or why a payment was incomplete, limiting interpretation of payment patterns.
+
+2.  **Omitted Operational Context**
+
+    -   **Lack of Internal Timestamps:** The **`processing_time`** is calculated using only two external dates: **`application_start_date`** and **`issue_date`**. This simple duration does not account for time when the application was formally "stopped" or "paused" while waiting for the applicant to provide missing revisions or documentation. This limitation prevents precise measurement of the City's true internal review time.
+
+    -   **Absence of Project Scope Metrics:** The dataset does not include crucial physical metrics necessary to fully quantify structural complexity, such as building **square footage**, the number of **stories**, or the specific **materials** used. We are limited to using financial proxies to infer the scale and complexity of the construction work.
+
+### Data Processing
+
+Prior to modeling and analysis, the raw dataset underwent several cleaning and feature engineering steps to address data quality and transform variables into analytically useful forms:
+
+1.  **Data Cleaning and Filtering:** The initial 200,000 records were filtered to eliminate entries with critical data quality issues. Specifically, records were removed if the calculated **`processing_time`** was negative, or if the geographic coordinates (**`latitude`** and **`longitude`**) were zero, ensuring only valid, geocoded records remained. Furthermore, all categorical values were standardized by removing leading/trailing whitespace.
+
+2.  **Target Variable Creation:** The continuous **`processing_time`** was transformed into the binary factor variable **`rapid_processing`**, which is defined by a threshold of **seven days or less**, making it suitable for classification models like logistic regression.
+
+3.  **Feature Engineering:** New, critical predictors were derived to capture underlying project complexity and administrative pressure:
+
+    -   **Temporal Factors:** The date field **`application_start_date`** was parsed to create ordered factors for **`month`** and **`dow`** (day of week) to model seasonal and weekly trends.
+
+    -   **Geographic Groupings:** A simple area label **`area_ncs`** (Northside, Central, Southside) was created by segmenting the continuous **`latitude`** into tertiles, providing a coarse spatial grouping for regional analysis.
+
+    -   **Financial Ratios:** Ratios like **`mix_building`** (percentage of total fee derived from building fees) and **`fee_intensity`** ratios (fees relative to project cost) were calculated to quantify a permit's financial and structural complexity.
+
+These processing steps ensured the resulting dataset was clean, standardized, and rich with engineered features necessary to investigate the administrative, financial, and spatial dynamics of the permitting process.
+
+### Data Dictionary
+
+| Variable Name | Data Type | Description |
+|-------------------|-------------------|----------------------------------|
+| id | Character | Unique record ID from the portal. |
+| permit\_ | Character | City tracking number for the permit. |
+| permit_status | Character | Current status of the permit |
+| permit_milestone | Character | Current milestone in the review/issuance process. |
+| permit_type | Character | Permit type category. |
+| review_type | Character | Review path (e.g., EASY PERMIT vs plan review). |
+| application_start_date | Date | Date when the City began reviewing the application. |
+| issue_date | Date | Date the permit was ready to issue / issued. |
+| processing_time | Numeric | Days between application start and issue; non-negative. |
+| month | Factor | Month of application start (Jan–Dec, ordered). |
+| dow | Factor | Day of week of application start (Mon–Sun, ordered). |
+| work_type | Character | Classification of work authorized by the permit. |
+| building_fee_paid | Numeric | Building fee amount received. |
+| zoning_fee_paid | Numeric | Zoning review fee amount received. |
+| other_fee_paid | Numeric | Other permit-related fee amount received. |
+| subtotal_paid | Numeric | Sum of paid fees (building + zoning + other). |
+| building_fee_unpaid | Numeric | Building fee amount due. |
+| zoning_fee_unpaid | Numeric | Zoning review fee amount due. |
+| other_fee_unpaid | Numeric | Other permit-related fee amount due. |
+| subtotal_unpaid | Numeric | Sum of unpaid fees (building + zoning + other). |
+| building_fee_waived | Numeric | Building fee amount waived. |
+| zoning_fee_waived | Numeric | Zoning review fee amount waived. |
+| other_fee_waived | Numeric | Other permit-related fee amount waived. |
+| subtotal_waived | Numeric | Sum of waived fees (building + zoning + other). |
+| building_fee_subtotal | Numeric | Building fee total (paid + unpaid + waived). |
+| zoning_fee_subtotal | Numeric | Zoning fee total (paid + unpaid + waived). |
+| other_fee_subtotal | Numeric | Other fee total (paid + unpaid + waived). |
+| total_fee | Numeric | Grand total fees (paid + unpaid + waived). |
+| reported_cost | Numeric | Applicant’s estimated project cost. |
+| community_area | Integer | Chicago community area code. |
+| census_tract | Numeric | Census tract code for the property address. |
+| ward | Integer | City council district at time of issuance. |
+| xcoordinate | Numeric | City X coordinate |
+| ycoordinate | Numeric | City Y coordinate |
+| latitude | Numeric | Latitude of property address. |
+| longitude | Numeric | Longitude of property address. |
+| location | Character | Portal point field for mapping/geometries. |
+| area_ncs | Factor | Coarse area label from latitude: SOUTHSIDE / CENTRAL / NORTHSIDE. |
+| mix_building | Numeric | \% of total_fee from building fees (0–1). |
+| mix_zoning | Numeric | \% of total_fee from zoning fees (0–1). |
+| mix_other | Numeric | \% of total_fee from other fees (0–1). |
+| fee_intensity_total | Numeric | total_fee / reported_cost |
+| fee_intensity_paid | Numeric | subtotal_paid / reported_cost. |
+| fee_intensity_unpaid | Numeric | subtotal_unpaid / reported_cost. |
+| fee_intensity_waived | Numeric | subtotal_waived / reported_cost. |
+| app_date | Date | Application start date (alias). |
+| season | Factor | Season from month. |
+| is_central | Factor | Yes if area_ncs == "CENTRAL". |
+| cost_num | Numeric | Parsed reported_cost. |
+| fast_issue | Factor | Yes/No; processing_time \<= 7. |
+| same_day_issue | Factor | Yes/No; processing_time == 0. |
+| work2 | Factor | Trade vs Construction from work_type. |
+| work_bucket | Factor | Coarse grouping of work_type. |
+| split_nb | Factor | NB train/test flag (\~80/20 by app_date). |
+| nb_cost_bin | Factor | Ordered quintiles of log1p(cost_num). |
+
+# Naive Bayes
+
+```{r nb, include=FALSE}
+df_nb <- permits_raw %>%
+  transmute(
+    y = factor(work2, levels = c("Trade","Construction")),
+    split_nb,
+    permit_type, season, area_ncs, ward, community_area,
+    nb_cost_bin
+  ) %>% tidyr::drop_na(y, split_nb)
+
+trainXy <- df_nb %>% dplyr::filter(split_nb == "train") %>% dplyr::select(-split_nb)
+testXy  <- df_nb %>% dplyr::filter(split_nb == "test")  %>% dplyr::select(-split_nb)
+
+keep <- vapply(trainXy[-1], function(z) nlevels(droplevels(factor(z))) > 1, logical(1))
+trainXy <- cbind(y = trainXy$y, trainXy[-1][, keep, drop = FALSE])
+testXy  <- cbind(y = testXy$y,  testXy[-1 ][, keep, drop = FALSE])
+
+fac_cols <- names(Filter(is.factor, trainXy[-1]))
+for (col in fac_cols) {
+  testXy[[col]] <- factor(testXy[[col]], levels = levels(trainXy[[col]]))
+}
+testXy <- stats::na.omit(testXy)
+
+nb_fit <- e1071::naiveBayes(
+  y ~ ., data = trainXy,
+  laplace = 1,
+  prior = c(Trade = 0.5, Construction = 0.5)
+)
+
+folds   <- caret::createFolds(trainXy$y, k = 5, list = TRUE)
+th_grid <- seq(0.35, 0.65, by = 0.02)
+ba_at_t <- function(th){
+  mean(sapply(folds, function(idx){
+    tr <- trainXy[-idx,]; va <- trainXy[idx,]
+    m  <- e1071::naiveBayes(y ~ ., data = tr, laplace = 1,
+                            prior = c(Trade = 0.5, Construction = 0.5))
+    p  <- predict(m, newdata = va, type = "raw")[,"Trade"]
+    pred <- factor(ifelse(p >= th, "Trade","Construction"), levels = levels(va$y))
+    cm <- caret::confusionMatrix(pred, va$y, positive = "Trade")
+    mean(c(cm$byClass["Sensitivity"], cm$byClass["Specificity"]), na.rm = TRUE)
+  }))
+}
+t_star <- th_grid[which.max(sapply(th_grid, ba_at_t))]
+
+p_test <- predict(nb_fit, newdata = testXy, type = "raw")[,"Trade"]
+
+pred_05 <- factor(ifelse(p_test >= 0.5, "Trade","Construction"), levels = levels(testXy$y))
+cm_05   <- caret::confusionMatrix(pred_05, testXy$y, positive = "Trade")
+cat("\n== NB (equal priors, threshold = 0.50) ==\n"); print(cm_05)
+cat(sprintf("Balanced Accuracy: %.3f\n\n",
+            mean(c(cm_05$byClass["Sensitivity"], cm_05$byClass["Specificity"]), na.rm = TRUE)))
+
+pred_t  <- factor(ifelse(p_test >= t_star, "Trade","Construction"), levels = levels(testXy$y))
+cm_t    <- caret::confusionMatrix(pred_t, testXy$y, positive = "Trade")
+cat(sprintf("== NB (equal priors, tuned threshold t = %.2f) ==\n", t_star)); print(cm_t)
+cat(sprintf("Balanced Accuracy: %.3f\n",
+            mean(c(cm_t$byClass["Sensitivity"], cm_t$byClass["Specificity"]), na.rm = TRUE)))
+```
+
+## Row {.tabset data-height="170"}
+
+### Overview {data-height="520"}
+
+**Research question:** Can permits be classified as Trade vs Construction using administrative and context features?
+
+**Target:** `y = factor(work2, levels = c("Trade","Construction"))` (positive = **Trade**).
+
+**Split:** Time-aware **80/20** by `app_date` (train ≤ 80th percentile; test \> 80th).
+
+**Predictors :** `permit_type`, `season`, `area_ncs`, `ward`, `community_area`, and **`cost_bin`** derived from `cost_num` (train-only quintiles of `log1p(cost_num)`).
+
+## Row {.tabset data-height="740"}
+
+### Balanced Accuracy vs threshold {data-height="800"}
+
+```{r ba, fig.cap=" 5-fold CV shows Balanced Accuracy peaking at t*, balancing recall and specificity."}
+ba_vals <- sapply(th_grid, ba_at_t)
+th_df <- data.frame(threshold = th_grid, balanced_accuracy = ba_vals)
+
+ggplot(th_df, aes(threshold, balanced_accuracy)) +
+  geom_line() + geom_point() +
+  geom_vline(xintercept = t_star, linetype = 2) +
+  scale_x_continuous(breaks = th_grid) +
+  labs(title = "NB threshold tuning (train CV)",
+       x = "Decision threshold for P(Trade)",
+       y = "Balanced Accuracy (CV)") +
+  theme_minimal(base_size = 13)
+```
+
+### Class-conditional likelihoods {data-height="800"}
+
+```{r ccl, fig.cap="Trade clusters at high P(Trade) and Construction at low. Overlap drives errors."}
+prob_df <- data.frame(prob = as.numeric(p_test), truth = testXy$y) |>
+  filter(!is.na(prob))
+
+ggplot(prob_df, aes(prob, fill = truth)) +
+  geom_density(alpha = 0.45) +
+  labs(title = "Predicted P(Trade) by true class (test)",
+       x = "Predicted probability P(Trade)",
+       y = "Density", fill = "True class") +
+  theme_minimal(base_size = 13)
+```
+
+### Precision recall curve {data-height="800"}
+
+```{r prc, fig.cap="NB maintains high precision over a wide recall range for Trade."}
+pr_curve <- function(prob, truth, positive = "Trade"){
+  ok <- is.finite(prob) & !is.na(truth)
+  prob <- prob[ok]; truth <- truth[ok]
+  ord <- order(prob, decreasing = TRUE)
+  y   <- truth[ord] == positive
+  tp  <- cumsum(y)
+  fp  <- cumsum(!y)
+  fn  <- sum(y) - tp
+  precision <- tp / pmax(tp + fp, 1)
+  recall    <- tp / pmax(tp + fn, 1)
+  data.frame(recall = recall, precision = precision)
+}
+pr_df <- pr_curve(as.numeric(p_test), testXy$y, positive = "Trade")
+
+ggplot(pr_df, aes(recall, precision)) +
+  geom_path() + geom_point(size = 1, alpha = 0.5) +
+  labs(title = "Precision–Recall (test) — positive: Trade",
+       x = "Recall (Sensitivity)", y = "Precision (PPV)") +
+  theme_minimal(base_size = 13)
+```
+
+### Cumulative gains curve {data-height="800"}
+
+```{r cgc, fig.cap="Ranking by P(Trade) captures Trades far faster than random."}
+gain_df <- data.frame(prob = as.numeric(p_test), y = testXy$y)
+gain_df <- gain_df[order(-gain_df$prob), ]
+gain_df$cum_pos <- cumsum(gain_df$y == "Trade")
+P <- sum(gain_df$y == "Trade")
+N <- nrow(gain_df)
+gain_df$cum_frac_obs  <- seq_len(N)/N
+gain_df$cum_frac_pos  <- gain_df$cum_pos / P
+
+library(ggplot2)
+ggplot(gain_df, aes(cum_frac_obs, cum_frac_pos)) +
+  geom_line() +
+  geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  labs(title = "Cumulative gains (test)",
+       x = "Fraction of permits reviewed (ranked by P(Trade))",
+       y = "Fraction of all Trade captured") +
+  theme_minimal(base_size = 13)
+```
+
+### Summary
+
+A Naive Bayes classifier was trained to predict work2 as Trade or Construction using permit_type, season, area_ncs, ward, community_area, and an engineered cost_bin. The cost_bin feature was created by applying log1p to cost_num on the training data, cutting the result into quintiles, and assigning Unknown when cost was missing. A time based split was used: the earliest 80% of permits by application date formed training and the most recent 20% formed test. To prevent leakage and level mismatches, any predictor with a single level in training was dropped, and test factor levels were aligned to training. The model used equal class priors of 0.5 for each class to offset historical imbalance and Laplace smoothing of 1 to avoid zero probabilities. The decision threshold was tuned on the training set with five fold cross validation to maximize balanced accuracy, then both the default 0.5 and the tuned threshold were evaluated on the held out test set. Diagnostics show a well separated score distribution (Trade near 1, Construction near 0) with a modest overlap region, a strong precision and recall profile, and cumulative gains well above the random baseline, indicating useful ranking of Trade cases. Overall, this Naive Bayes model is an effective and transparent baseline. Further improvement is most likely to come from richer scope and location features rather than additional tuning of the same predictors.
+
+# kNN
+
+```{r kNN, include=FALSE}
+
+d <- permits_raw %>%
+  transmute(
+    same_day_issue = droplevels(same_day_issue),     
+    log_cost  = log1p(cost_num),                  
+    month_num = as.integer(month),                 
+    dow_num   = as.integer(dow)                   
+  ) %>% 
+  na.omit()
+
+# 70/30 split
+idx   <- sample(seq_len(nrow(d)), size = floor(0.7 * nrow(d)))
+train <- d[idx, ]
+test  <- d[-idx, ]
+
+trainX <- as.matrix(train[, c("log_cost","month_num","dow_num")])
+testX  <- as.matrix(test[,  c("log_cost","month_num","dow_num")])
+trainY <- train$same_day_issue
+testY  <- test$same_day_issue
+
+mu  <- colMeans(trainX)
+sds <- apply(trainX, 2, sd)
+trainZ <- scale(trainX, center = mu, scale = sds)
+testZ  <- scale(testX,  center = mu, scale = sds)
+
+k_grid <- seq(1, 31, 2)
+acc <- numeric(length(k_grid))
+for (i in seq_along(k_grid)) {
+  pred_i <- knn(train = trainZ, test = testZ, cl = trainY, k = k_grid[i])
+  acc[i] <- mean(pred_i == testY)
+}
+k_best <- k_grid[which.max(acc)]
+
+
+pred <- knn(train = trainZ, test = testZ, cl = trainY, k = k_best)
+confusionMatrix(pred, testY)
+
+
+acc_vs_k <- data.frame(k = k_grid, accuracy = acc)
+```
+
+## Row {.tabset data-height="140"}
+
+### Overview {data-height="520"}
+
+**Research Question:** In the Chicago building-permits data set, can same-day issuance be predicted?
+
+**Setup:** The model uses a 70/30 random split into training and test sets, z score scaling computed from the training set, Euclidean distance to measure similarity, and tuning of odd k values from 1 through 31 on the test split.
+
+**Predictors:** log1p(cost_num) as log_cost, month converted to month_num (1–12), and dow converted to dow_num (1–7), all z-scored using training-set means and standard deviations.
+
+## Row {.tabset data-height="740"}
+
+### Accuracy vs k {data-height="800"}
+
+```{r acc_plot, fig.cap="Accuracy rises quickly and levels off around k≈13. The best k is 13 (~0.74). This is still below the majority-class rate (~0.79), so performance is limited by the features rather than k."}
+ggplot(acc_vs_k, aes(k, accuracy)) +
+  geom_line() + geom_point() +
+  geom_vline(xintercept = k_best, linetype = 2) +
+  scale_x_continuous(breaks = acc_vs_k$k) +
+  labs(title = "KNN tuning: Accuracy vs k (test split)",
+       subtitle = paste("Selected k_best =", k_best),
+       x = "k (odd)", y = "Accuracy") +
+  theme_bw()
+```
+
+### Confusion Matrix {data-height="800"}
+
+```{r cm_plot, fig.cap="High recall and high precision for Yes; specificity is modest. Overall accuracy is ~0.74, below the majority baseline."}
+pos_label <- if ("Yes" %in% levels(testY)) "Yes" else tail(levels(testY), 1)
+cm <- caret::confusionMatrix(data = pred, reference = testY, positive = pos_label)
+cm_df <- as.data.frame(as.table(cm$table))
+names(cm_df) <- c("Truth","Predicted","Freq")
+
+cm_df$label_str <- format(cm_df$Freq, big.mark = ",")
+hi <- max(cm_df$Freq, na.rm = TRUE)
+cm_df$lab_color <- ifelse(cm_df$Freq >= 0.55 * hi, "white", "black")
+
+ggplot(cm_df, aes(Predicted, Truth, fill = Freq)) +
+  geom_tile(width = 0.96, height = 0.96, color = "white") +
+  geom_text(aes(label = label_str, colour = lab_color), size = 5, fontface = "bold", show.legend = FALSE) +
+  scale_colour_identity() +
+  scale_fill_viridis_c(option = "C", direction = -1, guide = "none") +
+  coord_equal() +
+  labs(title = "Confusion Matrix (test set)",
+       subtitle = paste("Positive class:", pos_label),
+       x = "Predicted", y = "Actual") +
+  theme_minimal(base_size = 14) +
+  theme(panel.grid = element_blank(),
+        plot.title.position = "plot")
+```
+
+### ROC curve {data-height="800"}
+
+```{r roc_plot, fig.cap="ROC lies close to the diagonal and AUC is about 0.50, indicating little class separation."}
+pos_label <- if ("Yes" %in% levels(testY)) "Yes" else tail(levels(testY), 1)
+
+pred_prob_obj <- FNN::knn(train = trainZ, test = testZ, cl = trainY,
+                          k = k_best, prob = TRUE)
+p_pred <- attr(pred_prob_obj, "prob") # proportion for the predicted class
+prob_pos <- ifelse(pred_prob_obj == pos_label, p_pred, 1 - p_pred)
+
+roc_obj <- roc(response = testY,
+               predictor = as.numeric(prob_pos),
+               levels = c(setdiff(levels(testY), pos_label), pos_label),
+               direction = ">")
+
+plot(roc_obj, legacy.axes = TRUE, main = sprintf("ROC (AUC = %.3f)", auc(roc_obj)))
+```
+
+### Calibration {data-height="800"}
+
+```{r cal_plot, fig.cap="Points track the 45° line, so probabilities are reasonably calibrated despite weak discrimination."}
+cal_df <- data.frame(truth = testY, prob = prob_pos) %>%
+  filter(!is.na(prob)) %>%
+  mutate(bin = cut(prob, breaks = seq(0,1,length.out=11), include.lowest = TRUE)) %>%
+  group_by(bin) %>%
+  summarise(pred = mean(prob), obs = mean(truth == pos_label), .groups = "drop")
+
+ggplot(cal_df, aes(pred, obs)) +
+  geom_point(size = 3) +
+  geom_line() +
+  geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  coord_equal(xlim = c(0,1), ylim = c(0,1)) +
+  labs(title = "Calibration Curve (test)",
+       subtitle = paste("Positive class:", pos_label),
+       x = "Mean predicted P(Yes)", y = "Observed P(Yes)") +
+  theme_bw()
+```
+
+### Summary
+
+To test whether same-day issuance is predictable from basic non-geographic features, a k-nearest neighbors classifier was trained using three inputs: the log of cost, the month number, and the day-of-week number. The data were split 70 percent training and 30 percent test. Features were standardized with training means and standard deviations. Euclidean distance was used. Odd k values from 1 to 31 were swept, and k = 13 was selected. On the test set the model reached about 0.74 accuracy. The majority class accounts for roughly 0.79 of the test set, so a simple majority rule performed better. The confusion matrix shows recall for Yes near 0.76, precision near 0.90, and specificity near 0.69. The ROC curve sits close to the diagonal with an area under the curve near 0.50, indicating little separation between classes. The calibration curve follows the forty-five degree line, so the probability estimates are reasonably honest even though ranking power is weak. Overall, with only these three predictors, same-day issuance is not meaningfully predictable beyond a naive baseline, and the limitation appears to be the feature set rather than the choice of k.
+
+# Overview & Results {data-navmenu="Spatial Analysis"}
+
+## Column {data-width="600"}
+
+### Analysis Overview
+
+**Question:** How does the spatial distribution of estimated project value (financial intensity) vary across Chicago during 2014-2024? Can this distribution be used to accurately predict a project's cost?
+
+The objective of this analysis is to model and visualize the smooth underlying geographical trend in construction costs. We employ a continuous modeling approach to move beyond arbitrary political boundaries, focusing instead on continuous spatial gradients.
+
+**Variable Selection:** To model the geographic trend, the project location is defined by the most granular continuous variables available, **latitude** and **longitude**. These coordinates serve as the two independent spatial predictors ($X$ and $Y$) that define the prediction surface. This choice is mandated by the need to capture continuous variation, allowing the analysis to identify sharp cost transitions (e.g., the boundary between the lakefront and inland areas) that would be obscured by using aggregated, discrete variables (such as Community Area).
+
+## Column {data-width="400"}
+
+### Model Methodology: Natural Cubic Splines
+
+The analysis uses a Natural Cubic Spline methodology, formalized as a linear model where the response variable is a function of the spline basis terms for latitude and longitude:
+
+$$\ln(\text{Cost}) = \beta_0 + \sum_{i=1}^{5} \beta_i \cdot ns(\text{Latitude})_i + \sum_{j=1}^{5} \gamma_j \cdot ns(\text{Longitude})_j + \epsilon$$
+
+**Degrees of Freedom:** A degrees of freedom of $df=5$ was selected for both latitude and longitude. This choice provides the necessary flexibility to capture complex, nonlinear curvature inherent to urban cost gradients (e.g., rapid cost change near the central business district) while maintaining smoothness and minimizing the risk of overfitting the noise present in individual permit costs.
+
+**Response Variable Transformation:** The raw permit cost variable is heavily right-skewed. To stabilize the variance and ensure the model meets the necessary linear regression assumptions, the response variable was transformed using the natural logarithm: $\ln(\text{reported\_cost})$. The final predicted surface is then exponentiated back to the original dollar metric for interpretability.
+
+The output of the model is a smooth, predicted surface of the average estimated construction cost, spatially distributed across the City of Chicago.
+
+## Column {data-width="700"}
+
+### Spatial Spline of Estimated Costs
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, fig.width=20, fig.height=10, out.width="100%"}
+spline_data <- permits_raw
+
+# log transform to ensure stability
+spline_data$log_cost <- log(spline_data$reported_cost)
+
+fit_spline <- lm(log_cost ~ ns(latitude, df = 5) + ns(longitude, df = 5),
+                 data = spline_data)
+
+lat_seq <- seq(min(spline_data$latitude), max(spline_data$latitude), length.out = 100)
+lon_seq <- seq(min(spline_data$longitude), max(spline_data$longitude), length.out = 100)
+grid <- expand.grid(latitude = lat_seq, longitude = lon_seq)
+
+# predict on the grid
+grid$pred_log_cost <- predict(fit_spline, newdata = grid)
+
+# convert back to dollars
+grid$pred_cost <- exp(grid$pred_log_cost)
+
+# grab data on chicago's community boundaries
+sf_url <- "https://data.cityofchicago.org/resource/igwz-8jzy.geojson"
+comm_areas <- st_read(sf_url, quiet = TRUE)
+
+# keep only points within Chicago
+grid_sf <- st_as_sf(grid, coords = c("longitude", "latitude"), crs = 4326)
+grid_filtered <- grid_sf[comm_areas, ]
+
+# convert back to regular dataframe with coordinates
+grid_filtered <- grid_filtered %>%
+  mutate(
+    longitude = st_coordinates(.)[,1],
+    latitude = st_coordinates(.)[,2]) %>%
+  st_drop_geometry()
+
+ggplot() +
+  # spline surface
+  geom_raster(data = grid_filtered, aes(x = longitude, y = latitude, fill = pred_cost), interpolate = TRUE) +
+  scale_fill_viridis_c(name = "Estimated Cost ($)", option = "magma") +
+  
+  # community boundaries
+  geom_sf(data = comm_areas, color = "black", 
+          fill = NA, linewidth = 0.25) +
+  labs(
+    title = "Chicago Building Permits: Spatial Spline of Estimated Costs",
+    x = "Longitude",
+    y = "Latitude") +
+  
+  coord_sf() +
+  theme_void()
+```
+
+### Top 10 Chicago Communities by Construction Activity (2014-2025)
+
+```{r echo=FALSE}
+# join permits with community areas, rank by activity
+permits_sf <- st_as_sf(permits_raw, coords = c("longitude", "latitude"), crs = 4326)
+permits_with_community <- st_join(permits_sf, comm_areas)
+
+community_summary <- permits_with_community %>%
+  st_drop_geometry() %>%
+  group_by(community) %>%
+  summarize(
+    total_permits = n(),
+    total_cost = sum(reported_cost, na.rm = TRUE),
+    avg_cost = mean(reported_cost, na.rm = TRUE)) %>%
+  arrange(desc(total_permits)) %>%
+  slice(1:10) %>%  # top 10 communities
+  mutate(
+    total_cost = scales::dollar(total_cost),
+    avg_cost = scales::dollar(avg_cost, accuracy = 1))
+
+# display table
+kable(community_summary, 
+      col.names = c("Community Area", "Total Permits", "Total Cost", "Average Cost"),
+      caption = "Top 10 Chicago Communities by Construction Activity (2014-2025)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## Column {data-width="300"}
+
+### Spatial Pattern Interpretation
+
+Despite the low explanatory power, the visualization of the fitted spline surface provides clear evidence regarding the geographical distribution of construction intensity:
+
+**Concentrated Intensity:** The highest predicted construction costs, visualized as a dark red to orange gradient on the surface, are highly concentrated within the Central Business District and along the adjacent Near North Side and Lakefront communities. This area represents the nexus of affluent commercial, infrastructure, and luxury residential development in Chicago.
+
+**Decentralization Gradient:** A steep gradient is observable, with average costs decreasing significantly as one moves westward and southward away from the lakefront.
+
+**Peripheral Activity:** Communities in the far South and Northwest of the city exhibit the lowest estimated costs (visualized as cooler colors). This suggests that construction activity in these regions is predominantly comprised of smaller-scale, less complex projects, such as routine maintenance or minor residential additions, compared to the large scale investments seen centrally.
+
+### Quantitative Proof of Spatial Intensity
+
+This quantitative analysis confirms the dual nature of construction activity in Chicago:
+
+**High Financial Intensity:** The Loop, Near North Side, and Near West Side exhibit the highest average cost per permit, with the Near West Side leading at \$24,709. This validates the high cost hot spot seen on the map, indicating that the central corridor is host to the highest-value individual projects.
+
+**High Volume, Low Value:** Areas like Austin and Auburn Gresham rank highly in Total Permits (volume) but report the lowest average project values \$2,973 and \$2,287. This confirms the map's West/South Gradient, indicating that activity in these regions is frequent but dominated by low-value, small scale work, sharply contrasting with central investment.
+
+# Model Validation {data-navmenu="Spatial Analysis"}
+
+## Column {data-width="100%"}
+
+### Model Diagnostics
+
+Prior to interpretation, the spatial spline model was subjected to diagnostic checks required for Multiple Linear Regression.\
+The primary concern of heteroscedasticity inherent in cost data was substantially mitigated by transforming the response variable to its natural logarithm ($\ln(\text{Cost})$).
+
+Residual analysis confirmed that while the model provided a robust fit to the non-linear spatial trend, the sheer volume and complexity of the raw data led to expected deviations from perfect normality and homoscedasticity in the residuals.\
+Given that the primary objective was visualization of the average spatial trend rather than point-wise inference, the model was deemed sufficiently stable for analysis.
+
+## Column {data-width="100%"}
+
+### Diagnostic Plots
+
+```{r, fig.width=20, fig.height=10, out.width="100%"}
+# plot layout
+par(mfrow = c(1, 3), mar = c(4, 4, 2, 1) + 0.1) 
+
+# resid vs fitted
+plot(fit_spline$fitted.values, resid(fit_spline),
+     main="Residuals vs Fitted",
+     xlab="Fitted Values", ylab="Residuals",
+     pch=19, col="#1f77b4", cex=0.6)
+abline(h=0, lty=2, col="black")
+
+#  resid distribution
+hist(resid(fit_spline),
+breaks=30, col="#1f77b4", border="white",
+main="Residual Distribution", xlab="Residuals")
+
+# normal Q–Q
+qqnorm(resid(fit_spline), pch=19, col="#1f77b4", main="Normal Q–Q")
+qqline(resid(fit_spline), col="black", lty=2)
+
+# plot layout
+par(mfrow = c(1, 1), mar = c(5, 4, 4, 2) + 0.1)
+```
+
+## Column {data-width="500"}
+
+### Model Validation
+
+The model demonstrated a highly statistically significant fit to the data:
+
+**Overall Significance:** The full model is statistically significant, as indicated by the F-statistic $[F(10, 64852) = 48.08, p < 2.2e-16]$. This confirms that the observed geographical clustering of high-cost construction is not random.
+
+**Explanatory Power:** The adjusted $R^2$ value is extremely low ($\text{Adjusted } R^2 = 0.007206$). This translates to the spatial coordinates explaining less than 0.75% of the variance in the log-reported cost.
+
+### Critical Conclusion
+
+The statistical findings lead to a critical conclusion: while geography creates a detectable trend in average project cost, **the location itself is a weak predictor for the cost of an individual construction project**.
+
+Project specific factors are expected to drive the majority of variance in the cost.
+
+# Overview & Results {data-navmenu="Logistic Classification"}
+
+## Column {data-width="600"}
+
+### Analysis Overview
+
+**Question:** Can we predict which permits will face processing delays and what factors contribute to processing bottlenecks across Chicago's neighborhoods?
+
+**Variable Selection:** The variables were selected to represent core operational and structural hypotheses, including project complexity (cost tier, work type), time-based pressures (seasonal factors), and administrative indicators (waived fees, payment ratios). This feature set allowed the model to test whether delays are primarily driven by the inherent structural complexity of a permit or by temporary capacity constraints (such as daily volume).
+
+## Column {data-width="700"}
+
+### Model Methodology: Logistic Classification
+
+The model methodology centered on fine-tuning the classification threshold to achieve an optimal operational result, specifically prioritizing Sensitivity (catching delays) over overall Accuracy. This was necessary because the default threshold (0.5) yielded zero predictive power for the rare "Slow" class. Adjusting the threshold to 0.85 provided the necessary trade off to successfully identify 60% of all delayed permits.
+
+```{r}
+# create processing time variable and features
+permits_analysis <- permits_raw %>%
+  
+  # convert dates and calculate processing time
+  mutate(
+    issue_date = as.Date(issue_date),
+    application_start_date = as.Date(application_start_date),
+    processing_days = as.numeric(
+      difftime(issue_date, application_start_date, units = "days"))) %>%
+  
+  # remove data quality issues
+  filter(
+    processing_days >= 0,
+    !is.na(processing_days),
+    reported_cost > 0) %>%
+  
+  # create outcome variable: Rapid = 7 days or less
+  mutate(
+    rapid_processing = ifelse(processing_days <= 7, 1, 0),
+    rapid_processing = factor(
+      rapid_processing, 
+      levels = c(0, 1), 
+      labels = c("Slow", "Rapid"))) %>%
+  
+  # daily workload metrics
+  group_by(application_start_date) %>%
+  mutate(
+    daily_volume = n(),
+    daily_avg_cost = mean(reported_cost, na.rm = TRUE)) %>%
+  ungroup() %>%
+  
+  # ward and month workload metrics
+  group_by(year(application_start_date), month(application_start_date), ward) %>%
+  mutate(
+    ward_monthly_volume = n()) %>%
+  ungroup() %>%
+  
+  # create additional features
+  mutate(
+    # payment patterns
+    payment_complete = subtotal_unpaid == 0,
+    has_waived_fees = subtotal_waived > 0,
+    payment_ratio = subtotal_paid / (total_fee + 1),
+    
+    # geographic/administrative patterns
+    high_volume_ward = ward_monthly_volume > median(ward_monthly_volume),
+    
+    # cost categories
+    cost_tier = cut(
+      reported_cost,
+      breaks = c(0, 5000, 25000, 100000, 500000, Inf),
+      labels = c("Minimal", "Low", "Medium", "High", "Major")
+    ),
+    
+    # fee complexity
+    fee_structure_simple = (mix_building > 0.9) | 
+                           (mix_zoning > 0.9) | 
+                           (mix_other > 0.9),
+    multiple_fee_types = (building_fee_subtotal > 0) + 
+                         (zoning_fee_subtotal > 0) + 
+                         (other_fee_subtotal > 0),
+    
+    # time features
+    is_holiday_season = month %in% c("Nov", "Dec"),
+    is_summer = month %in% c("Jun", "Jul", "Aug"),
+    is_monday = dow == "Mon",
+    is_friday = dow == "Fri",
+    
+    # review complexity
+    easy_permit_flag = grepl("EASY", review_type, ignore.case = T),
+    complex_review = !easy_permit_flag
+  )
+
+permits_analysis <- na.omit(permits_analysis)
+
+# create data partition, 70% Training, 30% Testing
+train_idx <- createDataPartition(
+  permits_analysis$rapid_processing, 
+  p = 0.7, 
+  list = FALSE)
+
+training_data <- permits_analysis[train_idx, ]
+testing_data <- permits_analysis[-train_idx, ]
+
+
+# fit the model
+logit_model <- glm(
+  rapid_processing ~
+    poly(as.numeric(month), 3, raw = FALSE) +  # reduce from 11th degree to 3rd
+    poly(as.numeric(dow), 2, raw = FALSE) +   # reduce from 6th degree to 2nd
+    is_holiday_season + is_summer +
+
+    # cost and fee structure
+    log(reported_cost + 1) + cost_tier + work_type +
+    mix_building + fee_intensity_total +
+
+    # payment patterns
+    has_waived_fees + payment_ratio +
+
+    # workload indicators 
+    daily_volume + ward_monthly_volume + high_volume_ward +
+
+    # geographic
+    ward +
+
+    # interactions 
+    work_type:log(reported_cost + 1),
+
+  data = training_data,
+  family = binomial(link = "logit"),
+  control = glm.control(maxit = 100)
+)
+
+
+# summary(logit_model)
+
+```
+
+## Column {data-width="800"}
+
+### Odds-Ratio Plot {data-height="700"}
+
+```{r, echo=FALSE,  fig.width=25, fig.height=15, out.width="100%"}
+odds_ratios <- tidy(logit_model, conf.int = T) %>%
+  mutate(
+    odds_ratio = exp(estimate),
+    conf_low = exp(conf.low),
+    conf_high = exp(conf.high),
+    significance = ifelse(p.value < 0.05, "Significant", "Not significant")) %>%
+  filter(term != "(Intercept)")
+
+odds_ratio_plot <- odds_ratios %>%
+  filter(
+    significance == "Significant",
+    !str_detect(term, "poly\\(|:"), # ignore confusing polynomials
+    str_detect(term, "cost_tier|mix_building|daily_volume|work_type|has_waived_fees|fee_intensity_total")) %>%
+  
+  # clean the labels
+  mutate(
+    Factor = case_when(
+      term == "daily_volume" ~ "Daily Volume",
+      term == "mix_building" ~ "Building Complexity",
+      term == "has_waived_feesTRUE" ~ "Waived Fees ",
+      term == "fee_intensity_total" ~ "Total Fee Intensity",
+      str_detect(term, "cost_tier") ~ str_replace(term, "cost_tier", "Cost Tier: "),
+      str_detect(term, "work_type") ~ str_replace(term, "work_type", "Work Type: "),
+      TRUE ~ term)) %>%
+  
+  # exclude extreme outliers for better plot scale
+  filter(odds_ratio < 10) %>% 
+  
+  # sort factors for clear visualization
+  mutate(
+    Factor = fct_reorder(Factor, odds_ratio)) %>%
+  
+  
+  # plot the data
+  ggplot(aes(x = odds_ratio, y = Factor)) +
+    geom_point(color = "darkblue", size = 3) +
+    geom_errorbarh(aes(xmin = conf_low, xmax = conf_high), height = 0.2, color = "skyblue", linewidth = 1) +
+    
+    # line for reference
+    geom_vline(xintercept = 1, linetype = "dashed", color = "red", linewidth = 1) +
+    
+    # use log scale for better interpretability
+    scale_x_log10(
+      breaks = c(0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0),
+      labels = c("0.01", "0.05", "0.1", "0.5", "1.0", "2.0", "5.0")) +
+    
+    labs(
+      title = "Odds Ratios for Rapid Permit Processing: Key Bottleneck Factors",
+      subtitle = "OR < 1 indicates a bottleneck (higher risk of delay) | Plotted on a log scale",
+      x = "Odds Ratio (with 95% CI)",
+      y = "Predictor Factor") +
+  
+    theme_minimal(base_size = 14) +
+    theme(plot.title = element_text(face = "bold"))
+
+odds_ratio_plot
+```
+
+## Column {data-width="700"}
+
+### Interpretation of Odds-Ratio Plot
+
+The Odds Ratios plot reveals that the primary bottlenecks are structural, driven by Cost Tier and Building Complexity, where Major and High-Cost permits have less than half the odds of rapid processing.
+
+The model confirms that simple Monthly Maintenance permits are highly streamlined. Notably, the Daily Volume shows no significant independent impact on processing speed, suggesting the core issue is not administrative capacity but the intensive review required by complex projects.
+
+## Column {data-width="700"}
+
+### Conclusions
+
+Overall, the problem of permit delays is structural, and the solution lies in proactive, targeted intervention.
+
+The Odds Ratio analysis shows that processing bottlenecks are primarily driven by project complexity, with Major and High-Cost permits having drastically reduced odds of rapid processing (OR ≪1). Critically, Daily Volume is not a significant cause of delay, meaning the issue is intensive review, not simple administrative capacity.
+
+The predictive model correctly flags 60% of all potential delays, proving that targeted intervention is possible. However, the operational cost is high, achieving this coverage requires the department to accept a low Precision of 26.3% due to thousands of necessary false alarms.
+
+The best strategy is to use the model's signal to direct resources toward high-cost and complex permits, the source of the structural bottleneck, and actively manage the 60% of potential delays it successfully identifies.
+
+# Model Diagnostics {data-navmenu="Logistic Classification"}
+
+## Column {data-width="700"}
+
+### Model Validity
+
+```{r}
+# predicted probabilities/classes
+predicted_probs <- predict(logit_model, newdata = testing_data, type = "response")
+predicted_class <- factor(
+  ifelse(predicted_probs > 0.85, "Rapid", "Slow"),
+  levels = c("Slow", "Rapid"))
+
+# actual outcomes
+actual_outcomes <- testing_data$rapid_processing
+
+# calculate AUC and ROC
+roc_obj <- roc(actual_outcomes, predicted_probs)
+auc_value <- auc(roc_obj)
+
+# df for ggplot ROC plot
+roc_df <- data.frame(
+fpr = rev(1 - roc_obj$specificities),
+tpr = rev(roc_obj$sensitivities)
+)
+
+# plot ROC and AUC
+ggplot(roc_df, aes(x = fpr, y = tpr)) +
+geom_line(size = 1) +
+geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+labs(
+title = paste0("ROC Curve (AUC = ", round(auc_value, 4), ")"),
+x = "False Positive Rate (1 - Specificity)",
+y = "True Positive Rate (Sensitivity)"
+) +
+theme_minimal(base_size = 13) + # needed to fit on dashboard
+theme(plot.title = element_text(face = "bold")) 
+
+# confusion matrix
+cm <- confusionMatrix(predicted_class, actual_outcomes)
+
+# 2. Convert to a data frame for plotting
+cm_df <- as.data.frame(cm$table)
+
+# 3. Create the heatmap plot
+cm_plot <- ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), vjust = 0.5, color = "white", size = 6) +
+  scale_fill_gradient(low = "#1f77b4", high = "#5aa5d2") + # Blue color gradient
+  labs(
+    title = "Logistic Model Confusion Matrix",
+    x = "Actual Outcome",
+    y = "Predicted Outcome",
+    fill = "Count"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+
+cm_plot
+```
+
+## Column {data-width="700"}
+
+### Model Limitations
+
+This result, based on an operationally tuned threshold, correctly identifies 60% of all potential permit delays (Sensitivity = 0.60382). However, this proactive approach comes with a significant operational cost. For every four permits flagged for intervention, three are false alarms, resulting in a low Precision of 26.3%. Therefore, the model provides an acceptable trade off, enabling the department to prevent over half of all delays at the expense of substantial workload reviewing permits that would have been fast tracked anyway.
+
+# Multi Linear Regression
+
+```{r mlr, include=FALSE, warning=FALSE}
+fi_df <- permits_raw %>%
+  mutate(
+    reported_cost = suppressWarnings(as.numeric(reported_cost)),
+    total_fee     = suppressWarnings(as.numeric(total_fee))
+  ) %>%
+  filter(!is.na(reported_cost), reported_cost > 0, !is.na(total_fee)) %>%
+  transmute(
+    fee_intensity_total = total_fee / reported_cost,
+    log_cost_raw = log1p(reported_cost),
+    permit_type    = as.factor(permit_type),
+    area_ncs       = as.factor(area_ncs),
+    season         = as.factor(season),
+    ward           = as.factor(ward),
+    community_area = as.factor(community_area)
+  ) %>%
+  droplevels()
+
+fi_df <- fi_df %>%
+  mutate(
+    c_log_cost = as.numeric(scale(log_cost_raw, center = TRUE, scale = FALSE)),
+    c_log_cost_sq = c_log_cost^2
+  )
+
+loc_block <- if (!is.null(fi_df$ward) && is.factor(fi_df$ward) && nlevels(fi_df$ward) >= 2) {
+  "ward"
+} else if (!is.null(fi_df$community_area) && is.factor(fi_df$community_area) && nlevels(fi_df$community_area) >= 2) {
+  "community_area"
+} else {
+  character(0)
+}
+
+fac_candidates <- c("permit_type", "area_ncs", "season", loc_block)
+fac_keep <- fac_candidates[
+  sapply(fi_df[intersect(names(fi_df), fac_candidates)], function(x) is.factor(x) && nlevels(x) >= 2)
+]
+fac_drop <- setdiff(fac_candidates, fac_keep)
+
+rhs_terms <- c("c_log_cost", "c_log_cost_sq", fac_keep)
+if ("area_ncs" %in% fac_keep) rhs_terms <- c(rhs_terms, "c_log_cost:area_ncs")
+form <- as.formula(paste("fee_intensity_total ~", paste(rhs_terms, collapse = " + ")))
+
+fit_fi <- lm(form, data = fi_df)
+
+cat("Predictors used:\n  ", paste(rhs_terms, collapse = ", "), "\n")
+if (length(fac_drop) > 0) cat("Dropped (1 level after filtering):\n  ", paste(fac_drop, collapse = ", "), "\n")
+
+summary(fit_fi)
+lmtest::coeftest(fit_fi, vcov = sandwich::vcovHC(fit_fi, type = "HC3"))
+```
+
+## Row {.tabset data-height="180"}
+
+### Overview {data-height="520"}
+
+**Research Question:** In the Chicago building-permits data, how do project characteristics, review factors, and location explain variation in fee intensity defined as total_fee divided by reported_cost?
+
+**Setup:** Multiple linear regression using ordinary least squares with HC3 robust standard errors. The analysis uses all permits with positive reported_cost and non missing total_fee. Fee intensity is constructed as a ratio. Cost enters as a centered log1p transform with a quadratic term. Factors are included only if they retain two or more levels after filtering. Diagnostics use trimmed visuals for clarity.
+
+**Predictors:** Centered log1p(reported_cost) named c_log_cost. The squared term c_log_cost_sq. Area block area_ncs. Seasonal indicator season. Geographic detail ward. An interaction between c_log_cost and area_ncs. The variable permit_type was dropped because it collapsed to a single level after filtering.
+
+## Row {.tabset data-height="740"}
+
+### Predicted vs Actual Fee Intensity {data-height="800"}
+
+```{r, fig.cap="Predictions track the pattern but underpredict extremes with axes clipped at the 99th percentile."}
+pred <- predict(fit_fi, newdata = fi_df)
+viz  <- fi_df %>% mutate(pred = pred)
+
+y99 <- quantile(viz$fee_intensity_total, 0.99, na.rm = TRUE)
+p99 <- quantile(viz$pred,                0.99, na.rm = TRUE)
+
+ggplot(viz, aes(pred, fee_intensity_total)) +
+  geom_point(alpha = 0.2, size = 0.7) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  coord_cartesian(xlim = c(0, p99), ylim = c(0, y99)) +
+  labs(title = "Predicted vs Actual Fee Intensity",
+       subtitle = "Axes clipped at 99th percentile for readability",
+       x = "Predicted", y = "Actual") +
+  theme_bw()
+```
+
+### Residuals vs Fitted Values {data-height="800"}
+
+```{r, fig.cap="Residuals widen as fitted values grow and robust LOESS shows curvature."}
+
+rf <- data.frame(
+  fitted = fitted(fit_fi),
+  resid  = resid(fit_fi)
+) %>% filter(is.finite(fitted), is.finite(resid))
+
+cuts <- rf %>%
+  summarize(f01 = quantile(fitted, 0.01), f99 = quantile(fitted, 0.99),
+            r01 = quantile(resid,  0.01), r99 = quantile(resid,  0.99))
+
+rf_trim <- rf %>%
+  filter(between(fitted, cuts$f01, cuts$f99),
+         between(resid,  cuts$r01, cuts$r99))
+
+ggplot(rf_trim, aes(fitted, resid)) +
+  geom_point(alpha = 0.25, size = 0.7, na.rm = TRUE) +
+  geom_smooth(
+    se = FALSE, method = "loess", formula = y ~ x, span = 0.6,
+    method.args = list(family = "symmetric")   # robust to outliers
+  ) +
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  labs(title = "Residuals vs Fitted (Trimmed, Robust LOESS)",
+       subtitle = "Extremes trimmed at 1st/99th percentiles to prevent smoothing artifacts",
+       x = "Fitted values", y = "Residuals") +
+  theme_bw()
+```
+
+### Cost-Intensity Curve by Area {data-height="800"}
+
+```{r, fig.cap="Fee intensity falls then rises with cost, varying by area."}
+cost_grid <- quantile(fi_df$c_log_cost, probs = seq(0.01, 0.99, length.out = 60), na.rm = TRUE)
+area_lvls <- levels(fi_df$area_ncs)
+season_ref <- levels(fi_df$season)[1]
+ward_ref   <- levels(fi_df$ward)[1]
+
+newdat <- expand.grid(
+  c_log_cost = as.numeric(cost_grid),
+  area_ncs   = area_lvls,
+  season     = season_ref,
+  ward       = ward_ref
+)
+newdat$c_log_cost_sq <- newdat$c_log_cost^2
+
+newdat$pred <- predict(fit_fi, newdata = newdat)
+
+ggplot(newdat, aes(c_log_cost, pred, color = area_ncs)) +
+  geom_line(size = 1) +
+  labs(title = "Predicted Fee Intensity vs Centered Log Cost",
+       subtitle = paste("Lines by area_ncs; season =", season_ref, ", ward =", ward_ref),
+       x = "Centered log(cost)", y = "Predicted fee intensity") +
+  theme_bw() +
+  theme(legend.position = "top")
+```
+
+### Largest Ward Effects on Fee Intensity {data-height="800"}
+
+```{r, fig.cap="Several wards show large negative effects relative to the baseline."}
+rob <- lmtest::coeftest(fit_fi, vcov = sandwich::vcovHC(fit_fi, type = "HC3"))
+rob_df <- data.frame(
+  term     = rownames(rob),
+  estimate = rob[,1],
+  se       = rob[,2],
+  stat     = rob[,3],
+  p        = rob[,4],
+  row.names = NULL
+)
+
+ward_df <- rob_df %>%
+  dplyr::filter(grepl("^ward", term)) %>%
+  mutate(lo = estimate - 1.96*se,
+         hi = estimate + 1.96*se) %>%
+  slice_max(order_by = abs(estimate), n = 10)
+
+ggplot(ward_df, aes(x = reorder(term, estimate), y = estimate)) +
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  geom_pointrange(aes(ymin = lo, ymax = hi)) +
+  coord_flip() +
+  labs(title = "Largest Ward Effects (HC3)",
+       subtitle = "Top 10 by absolute coefficient; 95% robust CI",
+       x = "Ward", y = "Coefficient on fee intensity") +
+  theme_bw()
+```
+
+### Summary
+
+The multiple linear regression explains a moderate share of variability in fee intensity, with R\^2 about 0.39 and RMSE about 20. Fee intensity declines as reported cost rises at low to mid levels and then increases at very high costs, which is consistent with the U-shape implied by the quadratic in centered log cost. The decline with cost is stronger in the Central and Northside areas than in the Southside, reflecting the negative cost-by-area interactions. Seasonal effects are small and not reliably different from zero. Several wards differ meaningfully from the baseline ward, and the largest ward coefficients are negative, which indicates lower fee intensity than the baseline after controlling for cost and area. The predicted versus actual plot shows clustering near zero and underprediction at the extremes, and the residuals versus fitted plot indicates heteroskedasticity, so HC3 robust standard errors are reported. These results are descriptive rather than causal, and they should be interpreted with the ratio outcome, the many ward indicators, and potential omitted variables in mind.
